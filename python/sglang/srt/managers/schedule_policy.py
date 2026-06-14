@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from array import array
 
 from sglang.srt.environ import envs
@@ -502,9 +503,11 @@ class PrefillAdder:
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
+        self.dllm_prefill_chunk_size = dllm_config.prefill_chunk_size
+        self.dllm_alignment = math.lcm(self.page_size, self.dllm_block_size)
         max_running_reqs = dllm_config.max_running_requests
 
-        self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
+        self.rem_dllm_tokens = max_running_reqs * self.dllm_prefill_chunk_size
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -638,10 +641,43 @@ class PrefillAdder:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += extend_input_len
 
-    def _get_dllm_remain_tokens(self) -> int:
+    def _get_dllm_step_size(self, req: Req) -> int:
+        if req.is_dllm_prefill():
+            return self.dllm_prefill_chunk_size
+        return self.dllm_block_size
+
+    def _get_dllm_unmasked_extend_len(self, req: Req, prefix_len: int) -> int:
+        if not req.is_dllm_prefill():
+            return self.dllm_block_size
+
+        extend_ids = req.full_untruncated_fill_ids[prefix_len:]
+        try:
+            return extend_ids.index(self.dllm_config.mask_id)
+        except ValueError:
+            return len(extend_ids)
+
+    def _align_dllm_extend_len(self, extend_len: int) -> int:
+        return extend_len // self.dllm_alignment * self.dllm_alignment
+
+    def _align_dllm_prefill_extend_len(
+        self, req: Req, extend_len: int, max_extend_len: int
+    ) -> int:
+        aligned_len = self._align_dllm_extend_len(extend_len)
+        if aligned_len > 0:
+            return aligned_len
+        if req.is_dllm_prefill() and 0 < extend_len == max_extend_len:
+            return extend_len
+        return 0
+
+    def _get_dllm_remain_tokens(self, req: Optional[Req] = None) -> int:
+        step_size = (
+            self.dllm_prefill_chunk_size
+            if req is None
+            else self._get_dllm_step_size(req)
+        )
         _rem_tokens = min(
             self.rem_dllm_tokens,
-            self.dllm_block_size,
+            step_size,
             int(self.rem_total_tokens),
         )
         if _rem_tokens <= 0:
@@ -649,22 +685,55 @@ class PrefillAdder:
 
         return _rem_tokens
 
-    def _add_dllm_req(self, req: Req, prefix_len: int):
-        # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
-        # the diffusion unmask process may have some problems
-        # Make sure at least one page is available
-        trunc_len = (
-            min(self.rem_dllm_tokens, self.dllm_block_size)
-            // self.page_size
-            * self.page_size
+    def _add_dllm_req(self, req: Req, prefix_len: int) -> bool:
+        step_size = self._get_dllm_step_size(req)
+        max_extend_len = self._get_dllm_unmasked_extend_len(req, prefix_len)
+        raw_trunc_len = min(self.rem_dllm_tokens, step_size, max_extend_len)
+        trunc_len = self._align_dllm_prefill_extend_len(
+            req, raw_trunc_len, max_extend_len
         )
+        if trunc_len <= 0 and not req.is_dllm_prefill():
+            trunc_len = min(
+                self.rem_dllm_tokens,
+                self.dllm_block_size,
+                int(self.rem_total_tokens),
+                req.extend_input_len,
+            )
+            trunc_len = self._align_dllm_extend_len(trunc_len)
 
-        req.extend_input_len = trunc_len
+        if trunc_len <= 0:
+            return False
+
+        if hasattr(req, "set_extend_input_len"):
+            req.set_extend_input_len(trunc_len)
+        else:
+            req.extend_input_len = trunc_len
         req.fill_len = prefix_len + trunc_len
 
         self.can_run_list.append(req)
 
         self._update_prefill_budget(prefix_len, trunc_len, 0, req.retracted_stain)
+        return True
+
+    def _truncate_dllm_req(self, req: Req, prefix_len: int, rem_tokens: int) -> bool:
+        max_extend_len = self._get_dllm_unmasked_extend_len(req, prefix_len)
+        raw_trunc_len = min(req.extend_input_len, rem_tokens, max_extend_len)
+        trunc_len = self._align_dllm_prefill_extend_len(
+            req, raw_trunc_len, max_extend_len
+        )
+        if trunc_len <= 0 and not req.is_dllm_prefill():
+            trunc_len = min(req.extend_input_len, rem_tokens, self.dllm_block_size)
+            trunc_len = self._align_dllm_extend_len(trunc_len)
+
+        if trunc_len <= 0:
+            return False
+
+        if hasattr(req, "set_extend_input_len"):
+            req.set_extend_input_len(trunc_len)
+        else:
+            req.extend_input_len = trunc_len
+        req.fill_len = prefix_len + req.extend_input_len
+        return True
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
@@ -673,15 +742,16 @@ class PrefillAdder:
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
-        _rem_tokens = self._get_dllm_remain_tokens()
+        _rem_tokens = self._get_dllm_remain_tokens(req)
 
         if _rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
 
         # Truncate input length to available tokens and update request metadata
-        truncated = req.extend_input_len > _rem_tokens
-        req.extend_input_len = min(req.extend_input_len, _rem_tokens)
-        req.fill_len = len(req.prefix_indices) + req.extend_input_len
+        original_extend_input_len = req.extend_input_len
+        if not self._truncate_dllm_req(req, len(req.prefix_indices), _rem_tokens):
+            return AddReqResult.NO_TOKEN
+        truncated = req.extend_input_len < original_extend_input_len
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
@@ -697,13 +767,13 @@ class PrefillAdder:
         # Return based on remaining token availability
         return (
             AddReqResult.NO_TOKEN
-            if self._get_dllm_remain_tokens() <= 0
+            if self._get_dllm_remain_tokens(req) <= 0
             else AddReqResult.CONTINUE
         )
 
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
-            _rem_tokens = self._get_dllm_remain_tokens()
+            _rem_tokens = self._get_dllm_remain_tokens(req)
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             if self.is_hybrid_swa:
@@ -719,9 +789,15 @@ class PrefillAdder:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
 
+        original_extend_input_len = req.extend_input_len
         truncated = req.extend_input_len > _rem_tokens
-        req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
-        req.fill_len = len(req.prefix_indices) + req.extend_input_len
+        if self.dllm_config is not None:
+            if not self._truncate_dllm_req(req, len(req.prefix_indices), _rem_tokens):
+                return req
+            truncated = req.extend_input_len < original_extend_input_len
+        else:
+            req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
+            req.fill_len = len(req.prefix_indices) + req.extend_input_len
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -963,7 +1039,8 @@ class PrefillAdder:
                     truncation_align_size is None
                 ), "truncation_align_size is not supported for dllm prefill"
 
-                self._add_dllm_req(req, prefix_len)
+                if not self._add_dllm_req(req, prefix_len):
+                    return AddReqResult.NO_TOKEN
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill — the whole sequence is committed this iter.

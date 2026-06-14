@@ -31,6 +31,12 @@ threshold: 0.95
 
 # Default: 32, for LLaDA2MoeModelLM
 block_size: 32
+
+# Optional prompt prefill chunk size. Defaults to block_size.
+# Must be greater than or equal to block_size and a multiple of block_size.
+# Values larger than block_size require FlashInfer dLLM block-extend APIs from
+# flashinfer-ai/flashinfer#2722, commit d34bfc812d509bb2e6ab6d6f7371f58d0dc5fef0.
+prefill_chunk_size: 128
 ```
 
 JointThreshold Config:

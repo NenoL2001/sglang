@@ -55,10 +55,13 @@ class ReqDllmMixin:
             self.dllm_phase = DllmReqPhase.STAGING_DECODE
 
     def _init_fill_ids_for_dllm(self: Req):
+        prev_extend_input_len = getattr(
+            self, "extend_input_len", self.dllm_config.block_size
+        )
         self.dllm_block_offset = (
             0
             if self.fill_len == 0
-            else self.dllm_block_offset + self.dllm_config.block_size
+            else self.dllm_block_offset + prev_extend_input_len
         )
         self.full_untruncated_fill_ids = (
             self.origin_input_ids

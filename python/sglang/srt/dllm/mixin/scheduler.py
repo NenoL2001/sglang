@@ -262,7 +262,7 @@ class SchedulerDllmMixin:
             res = adder.add_one_req(
                 req,
                 has_chunked_req=True,
-                truncation_align_size=self.truncation_align_size,
+                truncation_align_size=None,
             )
 
             if res != AddReqResult.CONTINUE:

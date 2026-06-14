@@ -223,6 +223,20 @@ def compute_local_num_token_non_padded(
     )
 
 
+def build_dllm_positions(reqs, positions_dtype) -> torch.Tensor:
+    return torch.tensor(
+        [
+            i
+            for req in reqs
+            for i in range(
+                req.dllm_block_offset,
+                req.dllm_block_offset + req.extend_input_len,
+            )
+        ],
+        dtype=positions_dtype,
+    )
+
+
 @dataclass
 class NgramEmbeddingInfo:
     """Ngram embedding state for LongCat models."""
@@ -723,17 +737,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Override the positions with diffusion LLM or spec_info
         if batch.dllm_config is not None:
-            block_size = batch.dllm_config.block_size
             # Use int64 for AMD rotary embedding kernel compatibility
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
-            ret.positions = torch.tensor(
-                [
-                    i
-                    for block_offset in (req.dllm_block_offset for req in batch.reqs)
-                    for i in range(block_offset, block_offset + block_size)
-                ],
-                dtype=positions_dtype,
-            ).to(device, non_blocking=True)
+            ret.positions = build_dllm_positions(batch.reqs, positions_dtype).to(
+                device, non_blocking=True
+            )
+            assert ret.positions.numel() == num_tokens
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None

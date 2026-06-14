@@ -102,6 +102,24 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
+FLASHINFER_DLLM_BLOCK_EXTEND_PR = (
+    "https://github.com/flashinfer-ai/flashinfer/pull/2722"
+)
+FLASHINFER_DLLM_BLOCK_EXTEND_COMMIT = "d34bfc812d509bb2e6ab6d6f7371f58d0dc5fef0"
+
+
+def has_flashinfer_dllm_block_extend() -> bool:
+    try:
+        from flashinfer.dllm import (  # noqa: F401
+            BatchBlockExtendPagedOffsetWrapper,
+            BatchBlockExtendRaggedOffsetWrapper,
+            block_extend_attention_with_offset,
+        )
+    except ImportError:
+        return False
+    return True
+
+
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 MIMO_V2_MODEL_ARCHS = (
@@ -725,6 +743,7 @@ class ServerArgs:
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
     dllm_algorithm_config: Optional[str] = None
+    dllm_prefill_chunk_size: Optional[int] = None
 
     # Offloading
     cpu_offload_gb: int = 0
@@ -4529,6 +4548,10 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
+        from sglang.srt.dllm.config import DllmConfig
+
+        config = DllmConfig.from_server_args(self)
+
         # On AMD/HIP, disable cuda graph for DLLM and use triton backend
         if is_hip():
             if (
@@ -4563,10 +4586,29 @@ class ServerArgs:
             )
             self.disable_overlap_schedule = True
 
-        if not self.disable_radix_cache:
-            from sglang.srt.dllm.config import DllmConfig
+        if config.prefill_chunk_size > config.block_size:
+            prefill_backend, _ = self.get_attention_backends()
+            if prefill_backend != "flashinfer":
+                raise ValueError(
+                    "--dllm-prefill-chunk-size larger than dLLM block_size "
+                    "requires the FlashInfer attention backend."
+                )
+            if not has_flashinfer_dllm_block_extend():
+                raise ImportError(
+                    "Using --dllm-prefill-chunk-size larger than dLLM block_size "
+                    "requires flashinfer.dllm block-extend APIs. Install a "
+                    "FlashInfer build that includes "
+                    f"{FLASHINFER_DLLM_BLOCK_EXTEND_PR} "
+                    f"(commit {FLASHINFER_DLLM_BLOCK_EXTEND_COMMIT})."
+                )
+            if self.cuda_graph_config.decode.backend != Backend.DISABLED:
+                logger.warning(
+                    "Decode CUDA graph is disabled because "
+                    "dllm_prefill_chunk_size differs from dLLM block_size."
+                )
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
 
-            config = DllmConfig.from_server_args(self)
+        if not self.disable_radix_cache:
             if self.page_size % config.block_size != 0:
                 logger.warning(
                     f"Setting page size to {config.block_size} for diffusion LLM inference"
@@ -6654,6 +6696,15 @@ class ServerArgs:
             type=str,
             default=ServerArgs.dllm_algorithm_config,
             help="The diffusion LLM algorithm configurations. Must be a YAML file.",
+        )
+        parser.add_argument(
+            "--dllm-prefill-chunk-size",
+            type=int,
+            default=ServerArgs.dllm_prefill_chunk_size,
+            help=(
+                "The dLLM prompt prefill chunk size. Defaults to the diffusion "
+                "block size, preserving existing behavior."
+            ),
         )
 
         # Offloading

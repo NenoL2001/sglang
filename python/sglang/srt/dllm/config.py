@@ -1,7 +1,9 @@
-from typing import Any
+from __future__ import annotations
 
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.server_args import ServerArgs
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 
 class DllmConfig:
@@ -10,12 +12,14 @@ class DllmConfig:
         algorithm: str,
         algorithm_config: dict[str, Any],
         block_size: int,
+        prefill_chunk_size: int,
         mask_id: int,
         max_running_requests: int,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
         self.block_size = block_size
+        self.prefill_chunk_size = prefill_chunk_size
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
 
@@ -25,6 +29,8 @@ class DllmConfig:
     ):
         if server_args.dllm_algorithm is None:
             return None
+
+        from sglang.srt.configs.model_config import ModelConfig
 
         model_config = ModelConfig.from_server_args(
             server_args,
@@ -62,14 +68,31 @@ class DllmConfig:
                 )
             with open(server_args.dllm_algorithm_config, "r") as f:
                 algorithm_config = yaml.safe_load(f)
+            if algorithm_config is None:
+                algorithm_config = {}
 
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
+
+        prefill_chunk_size = algorithm_config.get("prefill_chunk_size", block_size)
+        if server_args.dllm_prefill_chunk_size is not None:
+            prefill_chunk_size = server_args.dllm_prefill_chunk_size
+        if prefill_chunk_size < block_size:
+            raise ValueError(
+                f"dllm_prefill_chunk_size ({prefill_chunk_size}) must be greater "
+                f"than or equal to dLLM block_size ({block_size})."
+            )
+        if prefill_chunk_size % block_size != 0:
+            raise ValueError(
+                f"dllm_prefill_chunk_size ({prefill_chunk_size}) must be a "
+                f"multiple of dLLM block_size ({block_size})."
+            )
 
         return DllmConfig(
             algorithm=server_args.dllm_algorithm,
             algorithm_config=algorithm_config,
             block_size=block_size,
+            prefill_chunk_size=prefill_chunk_size,
             mask_id=mask_id,
             max_running_requests=max_running_requests,
         )
